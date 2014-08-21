@@ -12,9 +12,22 @@ Contributors
 Requirements
 ---
 
-For cleaning, you'll need the standard [Anaconda](http://store.continuum.io) install, plus ... (Young-Jin, please fill
-this in: Pandas, what else?).  Modeling is all done in Weka, and you'll need a standard Weka install, (we put ours in
-`/usr/share/java/weka.jar`; if you put yours somewhere else you'll have to change the classpath in `run_weka.sh`).
+Python (we recommend installing anaconda as it will take care of all python dependencies):
+
+- pandas (0.14+)
+- scikit-learn
+- matplotlib
+- numpy
+- scipy
+- python multiprocessing
+
+    $ git clone git://github.com/dssg/caeh-public.git
+    $ cd caeh-public
+    $ pip install -r requirements.txt
+
+Non-Python:
+
+- weka (stable or development version)
 
 Cleaning the data requires about 16GB of free memory; if you don't have that, you're liable to get memory errors.
 Modeling, on a 16-core, 32GB machine, I can run about 8 models at once; 12 often fails.

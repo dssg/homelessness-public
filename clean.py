@@ -1,7 +1,9 @@
-"""The primary cleaning module.
+"""The cleaning module.
 
 Really the only method that's important for a user to know about is :func:`load`.  :func:`clean` is used to clean raw
 data into `clean/`, but is wrapped by `make`, (see `Makefile` and `README` for more info`).
+
+There are several functions that operate on `master`, and they all function on `master_all` as well.
 
 """
 import pandas as pd
@@ -17,11 +19,12 @@ script_dir = os.path.dirname(__file__)
 clean_dir = os.path.join(script_dir, 'clean')
 
 def clean(df_name):
-    """Given the data frame name, load the raw data and cleaned dependencies, clean the raw data, and save it as a csv
+    """Given the data frame name, load the raw data and cleaned dependencies, clean the raw data, and save it as a CSV
     and a pickle.
 
     :param df_name: The dataframe to clean.  This should be in the form `entry_details`, not `EntryDetails`.
     :type df: str.
+
     """
     df = load_raw(df_name)
 
@@ -47,6 +50,7 @@ def clean(df_name):
         df['ProgramExitDate'] = pd.to_datetime(df['ProgramExitDate'], format="%m/%d/%Y")
         # replace default value of 1980-01-01 with pd.NaT
         df['ProgramExitDate'].replace(datetime.datetime(1980,1,1), pd.NaT, inplace=True)
+        # compute `LengthOfStay` if possible
         df['LengthOfStay'] = (df['ProgramExitDate'] - df['ProgramEntryDate']).map(get_days_geq_0)
 
         df['YearOfBirth'].replace('#NUM!', np.NaN, inplace=True)
@@ -68,97 +72,128 @@ def clean(df_name):
 
         df['Veteran?'].replace(master_veteran_nans, np.NaN, inplace=True)
         # fill in all nulls with 'No (HUD)'
-        # this should just be a :func:`fillna`.
+        # TODO this should just be a :func:`fillna`.
         df['Veteran?Imputed'] = df['Veteran?'].apply(impute_veteran)
 
+        # get entry disability information, merge, and fill in any missing rows with `False`s
         df = pd.merge(df, get_disabilities('entry_disabilities').rename(columns=lambda x: x+" Entry"), left_on='EntryID', right_index=True, how='left')
         df.fillna({d: False for d in disability_types_entry}, inplace=True)
+        df['Disabled? Entry'] = df[disability_types_entry].any(axis=1)
 
+        # get review disability information, merge, and fill in any missing rows with `False`s
         df = pd.merge(df, get_disabilities('review_disabilities').rename(columns=lambda x: x+" Review"), left_on='EntryID', right_index=True, how='left')
         df.fillna({d: False for d in disability_types_review}, inplace=True)
+        df['Disabled? Review'] = df[disability_types_review].any(axis=1)
 
+        # use entry and review disability information to compute "general" disability information
         for dt in disability_types:
             df[dt] = df[dt+' Entry'] | df[dt+' Review']
-
-        df['Disabled? Entry'] = df[disability_types_entry].any(axis=1)
-        df['Disabled? Review'] = df[disability_types_review].any(axis=1)
         df['Disabled?'] = df[disability_types].any(axis=1)
 
+        # get entry income information, merge, and fill in any missing rows with `0`s
         entry_income_granular, entry_income_total = get_income('entry_income')
         df = pd.merge(df, entry_income_granular, left_on='EntryID', right_index=True, how='left')
         df = pd.merge(df, entry_income_total, left_on='EntryID', right_index=True, how='left')
         df.fillna({i: 0 for i in income_types}, inplace=True)
         df.fillna({'Last30DayIncome': 0}, inplace=True)
+        # bucket entry income
+        df['Last30DayIncomeBucket'] = df['Last30DayIncome'].apply(get_income_bucket)
 
+        # get exit income information, merge, and fill in any missing rows with `0`s
         exit_income_granular, exit_income_total = get_income('exit_income')
         df = pd.merge(df, exit_income_granular.rename(columns=lambda x: x+" Exit"), left_on='EntryID', right_index=True, how='left')
         df = pd.merge(df, exit_income_total.rename(columns=lambda x: x+" Exit"), left_on='EntryID', right_index=True, how='left')
         df.fillna({i: 0 for i in income_types_exit}, inplace=True)
         df.fillna({'Last30DayIncome Exit': 0}, inplace=True)
+        # bucket exit income
+        df['Last30DayIncomeExitBucket'] = df['Last30DayIncome Exit'].apply(get_income_bucket)
 
-	df['Last30DayIncomeBucket'] = df['Last30DayIncome'].apply(get_income_bucket)
-	df['Last30DayIncomeExitBucket'] = df['Last30DayIncome Exit'].apply(get_income_bucket)
-
-	df['EarnedIncomeExitHas'] = df['Earned Income (HUD) Exit'] > 0
-	df['EarnedIncomeExitChange'] =  df['Earned Income (HUD) Exit'] - df['Earned Income (HUD)']
-
-	df['CashIncomeExitHas'] = df['Last30DayIncome Exit'] > 0
-	df['CashIncomeExitChange'] =  df['Last30DayIncome Exit'] - df['Last30DayIncome']
-	
+        # get entry ncb information, merge, and fill in any missing rows with `False`s
         df = pd.merge(df, get_ncb('entry_ncb'), left_on='EntryID', right_index=True, how='left')
         df.fillna({d: False for d in ncb_types}, inplace=True)
 
+        # get exit ncb information, merge, and fill in any missing rows with `False`s
         df = pd.merge(df, get_ncb('exit_ncb'), left_on='EntryID', right_index=True, how='left', suffixes=('',' Exit'))
         df.fillna({d: False for d in ncb_types_exit}, inplace=True)
-
-	df['NCBIncomeHas'] = df[ncb_types+ncb_types_exit].any(axis=1)
-	df['NCBIncomeExitHas'] = df[ncb_types_exit].any(axis=1)
 
         df.replace({'PreviousLivingSituation': master_previous_living_situation_replacements}, inplace=True)
 
         df.replace({'LengthOfStayInPreviousLivingSituation': master_length_of_stay_in_previous_living_situation_replacements}, inplace=True)
 
+        # if we're cleaning `master`, compute legacy information about the first time a client entered the homelessness
+        # system, both into a program in general, and specifically into a "Homelessness Program" (see
+        # `providers_homelessness_programs`).
         if df_name == 'master':
+            # master
             master_all = load_clean('master_all')
+            # get info about first entry in a program in general
             df = pd.merge(df, first_entry(master_all), on='EntryID', how='left')
+            # get info about first entry in a "Homelessness Program" in general
             df = pd.merge(df, first_entry(master_all[master_all['HomelessnessProgram?'] == True]), on='EntryID', suffixes=('','HomelessnessProgram'), how='left')
+            # compute days since first entries
             df['DaysSinceFirstEntryBucket'] = df['DaysSinceFirstEntry'].apply(get_days_since_first_entry_bucket)
             df['DaysSinceFirstEntryHomelessnessProgramBucket'] = df['DaysSinceFirstEntryHomelessnessProgram'].apply(get_days_since_first_entry_bucket)
 
+        # load census zip data, and compare zip codes to see if they are valid
         zips = {z for z in load_auxiliary('zips')['zip'].values}
         df['ValidZipCodeOfLastPermanentAddress?'] = df['ZipCodeOfLastPermanentAddress'].apply(lambda z: z != '99999' and z in zips)
 
         df.replace({'DestinationAtExit': master_destination_at_exit_replacements}, inplace=True)
 
+        # check if a client was reviewed by looking for their `EntryID` in `review_details`
         reviews = {e for e in load_clean('review_details')['EntryID']}
         df['Reviewed?'] = df['EntryID'].apply(lambda e: e in reviews)
 
+        # find what services a client got, and compute if they got any
         df = pd.merge(df, get_services(df).rename(columns=lambda x: x+" Service"), left_on='EntryID', right_index=True, how='left')
         df.fillna({d: False for d in service_types}, inplace=True)
         df['Services?'] = df[service_types].any(axis=1)
 
+        ############
+        # Outcomes #
+        ############
+
+        # compute `CaseOutcome` and `CaseSuccess` from `DestinationAtExit`; `CaseSuccess` is just whether or not
+        # `CaseOutcome` is `Permanent`
         df['CaseOutcome'] = df.apply(get_case_outcome, axis=1)
         df['CaseSuccess'] = df['CaseOutcome'].apply(lambda o: np.NaN if pd.isnull(o) else o == 'Permanent')
 
+        # get reentry information, merge, and compute reentry outcomes
         df = pd.merge(df, get_reentries(df), on=['ClientUniqueID','ProgramExitDate'], suffixes=('','Reentry'), how='left')
         df['Reentered6Month'] = get_delta_reentries(df, np.timedelta64(6,'M'))
         df['Reentered12Month'] = get_delta_reentries(df, np.timedelta64(12,'M'))
+        # only merge rows whose `CaseOutcome` is 'Permanent'
         df['Reentered6MonthFromPermanent'] = get_delta_reentries(df, np.timedelta64(6,'M'))[df['CaseOutcome'] == 'Permanent']
         df['Reentered12MonthFromPermanent'] = get_delta_reentries(df, np.timedelta64(12,'M'))[df['CaseOutcome'] == 'Permanent']
 
+        # compute income outcomes
+        df['EarnedIncomeExitHas'] = df['Earned Income (HUD) Exit'] > 0
+        df['EarnedIncomeExitChange'] =  df['Earned Income (HUD) Exit'] - df['Earned Income (HUD)']
+        df['CashIncomeExitHas'] = df['Last30DayIncome Exit'] > 0
+        df['CashIncomeExitChange'] =  df['Last30DayIncome Exit'] - df['Last30DayIncome']
+
+        # compute ncb outcomes
+        df['NCBIncomeHas'] = df[ncb_types+ncb_types_exit].any(axis=1)
+        df['NCBIncomeExitHas'] = df[ncb_types_exit].any(axis=1)
+
+        # remove duplicate entries
         df = deduplicate_entry_id(df)
 
     elif df_name == 'providers':
         df = df[:-1] # ignore blank last row
 
+        # manually make a few providers' type into 'Street Outreach' to distinguish them as "Homelessness Programs"
         df.loc[df['Provider'].apply(lambda p: p in providers_street_outreach), 'AltProgramType'] = 'Street Outreach'
 
+        # get the `ProgramType`, `ProgramTypeAggregate`, and `HomelessnessProgram?` from `ProgramTypeCode` and `AltProgramType`
+        # TODO this should be a simple | statement between the two columns
         df['ProgramType'] = df.apply(get_program_type, axis=1)
         df['ProgramTypeAggregate'] = df['ProgramType'].replace(providers_program_type_aggregates)
         df['HomelessnessProgram?'] = df['ProgramType'].apply(lambda t: np.NaN if pd.isnull(t) else (t in providers_homelessness_programs))
 
     elif df_name == 'entry_details':
-        df = df[:-45292] # ignore blank last 45,292 rows
+        # ignore blank last 45,292 rows
+        df = df[:-45292]
 
     elif df_name == 'entry_disabilities':
         df.replace({'DisabilityType': disability_type_replacements}, inplace=True)
@@ -176,7 +211,8 @@ def clean(df_name):
         df.replace({'SourceOfNonCashBenefit': ncb_replacements}, inplace=True)
 
     elif df_name == 'review_details':
-        df = df[:-1] # ignore blank last row
+        # ignore blank last row
+        df = df[:-1]
 
         df['ReviewDate'] = pd.to_datetime(df['ReviewDate'], format="%m/%d/%Y")
 
@@ -194,11 +230,14 @@ def clean(df_name):
 
         df['ServiceStartDate'] = pd.to_datetime(df['ServiceStartDate'], format="%m/%d/%Y")
         df['ServiceEndDate'] = pd.to_datetime(df['ServiceEndDate'], format="%m/%d/%Y")
+        # compute `LengthOfService` if possible
         df['LengthOfService'] = (df['ServiceEndDate'] - df['ServiceStartDate']).map(lambda x: x/np.timedelta64(1, 'D'))
 
+        # compute Level 1 and Level 2 of AIRS taxonomy for each service
         df['ServiceTypeL1'] = df['ServiceCode'].apply(lambda x: x[0])
         df['ServiceTypeL2'] = df['ServiceCode'].apply(lambda x: x[:2] if len(x) > 1 else np.NaN)
 
+    # write output to pickel and CSV
     df.to_pickle(pickle_path(df_name))
     df.to_csv(csv_path(df_name))
 
@@ -206,6 +245,9 @@ def clean(df_name):
 
 def load_clean(df_name):
     """Given the data frame name, return the cleaned, pickled data frame
+
+    :param df_name: The dataframe to load.  This should be in the form `entry_details`, not `EntryDetails`.
+    :type df_name: str.
 
     """
     return pd.io.pickle.read_pickle(pickle_path(df_name))
@@ -216,12 +258,18 @@ load = load_clean
 def load_auxiliary(file_name):
     """Given the file name, return the auxiliary data frame
 
+    :param df_name: The dataframe to clean.  This is currently only used for `zips`.
+    :type df_name: str.
+
     """
     path = os.path.join(auxiliary_path, file_name + '.csv')
     return pd.read_csv(path, dtype=str)
 
 def load_raw(df_name):
     """Given the data frame name, return the raw data frame
+
+    :param df_name: The dataframe to load.  This should be in the form `entry_details`, not `EntryDetails`.
+    :type df_name: str.
 
     """
     path = os.path.join(raw_path, raw_names[df_name]+'.csv')
@@ -230,18 +278,23 @@ def load_raw(df_name):
 def pickle_path(df_name):
     """Given the data frame name, return the path to the clean pickle
 
+    :param df_name: The dataframe to load.  This should be in the form `entry_details`, not `EntryDetails`.
+    :type df_name: str.
+
     """
     return os.path.join(clean_dir, 'pickles', df_name+'.pkl')
 
 def csv_path(df_name):
     """Given the data frame name, return the path to the clean csv
 
+    :param df_name: The dataframe to load.  This should be in the form `entry_details`, not `EntryDetails`.
+    :type df_name: str.
+
     """
     return os.path.join(clean_dir, 'csvs', df_name+'.csv')
 
-# Constants
-
-raw_names = {'master':             'Master',
+# the raw names of the files we were given
+raw_names = {'master':              'Master',
              'master_all':          'Master',
              'entry_details':       'EntryDetails',
              'entry_income':        'EntryIncome',
@@ -257,17 +310,29 @@ raw_names = {'master':             'Master',
              'review_ncb':          'ReviewNCB',
              'review_disabilities': 'ReviewDisabilities'}
 
-## Date when HMIS switched to All Chicago 
+## date when HMIS switched to All Chicago 
 switch_date = datetime.datetime(2012, 9, 16)
 
-## Date of dump
+## date of dump
 dump_date = datetime.datetime(2014, 7, 1)
 
 def get_days_geq_0(t):
+    """Given an `numpy.timedelta64`, return the number of days it represents, and if it's less than 0, return `pd.NaT`.
+
+    :param t: The timedelta.
+    :type t: numpy.timedelta64.
+
+    """
     t = t/np.timedelta64(1, 'D')
     return t if t >= 0 else pd.NaT
 
 def get_refused(row):
+    """Given a row from `master`, return whether or not the client ever refused to answer a question.
+
+    :param row: A row from `master`.
+    :type row: dict-like.
+
+    """
     for _, v in row.iteritems():
         if v == 'Refused (HUD)' or  v == 'refused':
             return True
@@ -298,7 +363,12 @@ master_relationship_to_hoh_replacements = {'Son':                'Child',
                                            'Other':              np.NaN}
 
 def get_age_entered(row):
-    # returns years between entry year and birth year
+    """Return years between entry year and birth year.
+
+    :param row: A row from `master`.
+    :type row: dict-like.
+
+    """
     program_entry_date = row['ProgramEntryDate']
     year_of_birth = row['YearOfBirth']
     if program_entry_date is pd.NaT or year_of_birth is pd.NaT:
@@ -307,6 +377,12 @@ def get_age_entered(row):
         return dateutil.relativedelta.relativedelta(program_entry_date, year_of_birth).years
 
 def get_age_bucket(age):
+    """Return the age bucket.
+
+    :param age: Age.
+    :type age: int.
+
+    """
     if pd.isnull(age):
         return np.NaN
     elif age < 6:
@@ -318,9 +394,13 @@ def get_age_bucket(age):
     else:
         return '65 years and over'
 
-age_buckets = ['Under 6 years','6 to 17 years','18 to 64 years','65 years and over']
-
 def get_dfss_age_bucket(age):
+    """Return the DFSS age bucket.
+
+    :param age: Age.
+    :type age: int.
+
+    """
     if pd.isnull(age):
         return np.NaN
     elif age < 1:
@@ -342,13 +422,23 @@ def get_dfss_age_bucket(age):
     else:
         return 'DFSS: 62 years and over'
 
+age_buckets = ['Under 6 years','6 to 17 years','18 to 64 years','65 years and over']
+
 def get_family_composition(df):
+    """Given `master`, compute the age composition for each entry's family.  Do so by pivoting each `Entry Exit GroupID`
+    out on `AgeEnteredBucket`, then merge it into the dataframe to recover `EntryID`, so that it can be easily merged
+    back into `master`.
+
+    :param df: `master` dataframe.
+    :type df: pandas.Dataframe.
+    
+    """
     # prep f to pivot on 'Entry Exit GroupID' if there is one, otherwise on 'EntryID'
     f = df[['EntryID','Entry Exit GroupID','AgeEnteredBucket']].copy()
     f['Entry Exit GroupID'][pd.isnull(f['Entry Exit GroupID'])] = -f['EntryID']
     # build fp, a pivot table on 'AgeEnteredBucket'
-    f['count'] = 1
     # NOTE: this drops people who have no AgeEnteredBucket
+    f['count'] = 1
     fp = pd.pivot_table(f, values='count', index='Entry Exit GroupID', columns='AgeEnteredBucket', aggfunc=np.sum, fill_value=0)
     # compute 'OtherFamilyMembers'
     fp['OtherFamilyMembers'] = fp.sum(axis=1) - 1
@@ -387,6 +477,12 @@ race_replacements_4_way = {'Black or African American (HUD)':                 'B
                            'Asian (HUD)':                                     'Other (4-way)'}
 
 def get_race_ethnicity_4_way(row):
+    """Compute `Race/Ethnicity (4-way)`.  'Hispanic/Latino (HUD)' takes precedence.
+
+    :param row: A row from `master`.
+    :type row: dict-like.
+
+    """
     if row['Ethnicity'] == 'Hispanic/Latino (HUD)':
         return 'Hispanic/Latino (4-way)'
     else:
@@ -394,8 +490,14 @@ def get_race_ethnicity_4_way(row):
 
 master_veteran_nans = ["Don't Know (HUD)", 'Refused (HUD)']
 
-# this should just be a :func:`fillna`.
+# TODO this should just be a :func:`fillna`.
 def impute_veteran(veteran):
+    """Impute veteran status: if a client has no label, assume they are not a veteran.
+
+    :param veteran: A veteran status from `master`.
+    :type veteran: str.
+
+    """
     if pd.isnull(veteran):
         return 'No (HUD)'
     else:
@@ -453,12 +555,29 @@ master_length_of_stay_in_previous_living_situation_replacements = {'More than on
                                                                    'don t know':               np.NaN}
 
 def first_entry(ma):
+    """Given `master_all` or a subset thereof, get info about the first entry in a program for each `EntryID`.
+
+    :param ma: `master_all` or a subset thereof.
+    :type ma: pandas.Dataframe.
+
+    """
+    # sort `ma` by `ProgramEntryDate` and get the first entry for a given `ClientUniqueID`
     first_ma = ma.sort('ProgramEntryDate', inplace=False).groupby('ClientUniqueID').first()
+    # merge the firsts back into the dataframe
+    # XXX this can be engineered so that there are fewer columns, (and less memory,) involved
     ma_first_ma = pd.merge(ma, first_ma, left_on='ClientUniqueID', right_index=True, suffixes=('','OfFirstEntry'))
+    # compute `DaysSinceFirstEntry`
     ma_first_ma['DaysSinceFirstEntry'] = (ma_first_ma['ProgramEntryDate'] - ma_first_ma['ProgramEntryDateOfFirstEntry']).map(get_days_geq_0)
+    # only return the important columns, including `EntryID` for merging
     return ma_first_ma[['EntryID','ProgramEntryDateOfFirstEntry','ProgramTypeOfFirstEntry','DaysSinceFirstEntry']]
 
 def get_days_since_first_entry_bucket(d):
+    """Return the days-since-first-entry bucket.
+
+    :param d: Days.
+    :type d: int.
+
+    """
     if d < 1:
         return '0 days'
     elif d <= 7:
@@ -546,12 +665,22 @@ master_case_outcomes = {'Owned by client, no housing subsidy (HUD)':            
 psh_permanent_tenure = 180
 
 def psh_case_outcome(row):
+    """Given a row in PSH, compute the `CaseOutcome`.  This is complicated because we have to consider whether someone
+    was in PSH for at least 6 months, (`psh_permanent_tenure`).
+
+    :param row: A row from `master`.
+    :type row: dict-like.
+
+    """
+    # if we have `LengthOfStay`, use it
     if pd.notnull(row['LengthOfStay']):
         if row['LengthOfStay'] > psh_permanent_tenure:
             return 'Permanent'
         else: # in for less than psh_permanent_tenure
             return master_case_outcomes[row['DestinationAtExit']]
-    elif pd.notnull(row['ProgramEntryDate']): # no LengthOfStay, but ProgramEntryDate
+    # we don't have LengthOfStay, but we have ProgramEntryDate,
+    # so we can see if they entered >`psh_permanent_tenure` before when we got the data, (`dump_date`).
+    elif pd.notnull(row['ProgramEntryDate']):
         if row['ProgramEntryDate'] < dump_date - dateutil.relativedelta.relativedelta(days=psh_permanent_tenure):
             return 'Permanent'
         else: # in for less than psh_permanent_tenure
@@ -560,17 +689,30 @@ def psh_case_outcome(row):
         return master_case_outcomes[row['DestinationAtExit']]
 
 def get_case_outcome(row):
+    """Given a row, compute the `CaseOutcome`.  If the row is PSH, delegate to :func:`psh_case_outcome`; otherwise, just
+    use `DestinationAtExit`.
+
+    :param row: A row from `master`.
+    :type row: dict-like.
+
+    """
     if row['ProgramType'] == 'Permanent supportive housing (HUD)':
         return psh_case_outcome(row)
     else:
         return master_case_outcomes[row['DestinationAtExit']]
 
 def get_reentries(df):
+    """Given `master` or a subset thereof, find the next entry into a "Homelessness Program" for each exit.
+
+    :param df: `master`.
+    :type df: pandas.Dataframe.
+
+    """
     # just get the rows that exited, and get the important columns
     df_exits = df[pd.notnull(df['ProgramExitDate'])][['ClientUniqueID','ProgramExitDate']]
     # just get the rows that entered into a homelessness program, and get the columns that are important for reentry
     df_entries = df[df['HomelessnessProgram?'] == True][['ClientUniqueID','ProgramEntryDate','ProgramType']]
-    # merge on ClientUniqueID to get the cross product of all exits and entries on ClientID
+    # merge on ClientUniqueID to get the cross product of all exits and entries on ClientUniqueID
     df_ee = pd.merge(df_exits, df_entries, on='ClientUniqueID', how='right')
     # build a mask for all entries that happened after exits
     df_reentered = df_ee[df_ee['ProgramExitDate'] < df_ee['ProgramEntryDate']]
@@ -579,15 +721,22 @@ def get_reentries(df):
     return df_reentered.sort('ProgramEntryDate', inplace=False).groupby(['ClientUniqueID','ProgramExitDate']).head(1)[r_columns]
 
 def get_delta_reentries(df, delta):
+    """Given `master` or a subset thereof, compute which rows reentered within the given timedelta.
+
+    :param df: `master`.
+    :type df: pandas.Dataframe.
+    :param delta: the timedelta to consider.
+    :type delta: numpy.timedelta64.
+
+    """
     # get only the rows that exited delta before the dump_date
     exited_before_dump_minus_delta  = pd.notnull(df['ProgramExitDate']) & (df['ProgramExitDate'] + delta < dump_date)
-    
     # compute reentry before delta and return only to rows that meet the above criteria
     reentered_before_delta = pd.notnull(df['ProgramEntryDateReentry']) & (df['ProgramExitDate'] + delta > df['ProgramEntryDateReentry'])
     return reentered_before_delta[exited_before_dump_minus_delta]
 
 def deduplicate_entry_id(df):
-    """
+    """Given `master`, drop duplicates on EntryID, making sure to take the one with a `Relationship to HoH`.
     
     From the Chicago Alliance:
 
@@ -599,14 +748,27 @@ def deduplicate_entry_id(df):
 
     XXX since we're not differentiating Son & Daughter, we can just drop one of
     them.
+
+    :param df: `master`.
+    :type df: pandas.Dataframe.
+
     """
+    # get the duplicated rows
     duplicated = df[df.duplicated('EntryID')]['EntryID'].values
+    # only keep the rows that are not duplicated or that have a `Relationship to HoH`
     df = df[(df['EntryID'].apply(lambda i: i not in duplicated)) | (df['Relationship to HoH'].notnull())]
     df = df.drop_duplicates('EntryID')
 
     return df
 
 def get_program_type(row):
+    """Get the `ProgramType`, `ProgramTypeAggregate`, and `HomelessnessProgram?` from `ProgramTypeCode` and
+    `AltProgramType`.
+
+    :param row: A row from `master`.
+    :type row: dict-like.
+
+    """
     return row['AltProgramType'] if pd.notnull(row['AltProgramType']) else row['ProgramTypeCode']
 
 providers_street_outreach = ['Heartland Health Outreach Pathways Home Outpatient(533)',
@@ -642,6 +804,12 @@ disability_types_entry = [d+' Entry' for d in disability_types]
 disability_types_review = [d+' Review' for d in disability_types]
 
 def get_disabilities(df_name):
+    """Given either 'entry_disabilities' or 'review_disabilities', compute a pivot table of disabilities.
+
+    :param df_name: the name of the dataframe, either 'entry_disabilities' or 'review_disabilities'
+    :type df_name: str.
+
+    """
     df = load_clean(df_name)
     df = df[['EntryID','DisabilityType']].drop_duplicates()
     df['value'] = True
@@ -703,7 +871,14 @@ income_types_exit = ['Alimony or Other Spousal Support (HUD) Exit',
                      'Dividends (Investments) Exit']
 
 def get_income(df_name):
+    """Given either 'entry_income' or 'exit_income', compute a pivot table of incomes.
+
+    :param df_name: the name of the dataframe, either 'entry_income' or 'exit_income'
+    :type df_name: str.
+
+    """
     df = load_clean(df_name)
+    # sort by start date, and only take the most recent entry for a given `SourceOfIncome`
     df.sort('StartDate', inplace=True)
     df = df.groupby(['EntryID','SourceOfIncome']).last()['Last30DayIncome'].reset_index()
     df_granular = pd.pivot_table(df, values='Last30DayIncome', index='EntryID', columns='SourceOfIncome')
@@ -711,6 +886,12 @@ def get_income(df_name):
     return df_granular, df_total
 
 def get_income_bucket(dollars):
+    """Return the income bucket.
+
+    :param dollars: Income.
+    :type dollars: int.
+
+    """
     if pd.isnull(dollars):
         return np.NaN
     elif dollars == 0:
@@ -749,7 +930,14 @@ ncb_types = ['MEDICAID (HUD)',
 ncb_types_exit = [n+' Exit' for n in ncb_types]
 
 def get_ncb(df_name):
+    """Given either 'entry_ncb' or 'exit_ncb', compute a pivot table of ncbs.
+
+    :param df_name: the name of the dataframe, either 'entry_ncb' or 'exit_ncb'
+    :type df_name: str.
+
+    """
     df = load_clean(df_name)
+    # deduplicate
     df = df[['EntryID','SourceOfNonCashBenefit']].drop_duplicates()
     df['value'] = True
     return pd.pivot_table(df, values='value', index='EntryID', columns='SourceOfNonCashBenefit')
@@ -765,10 +953,20 @@ review_details_housing_status_aggregates = {'Stably housed (HUD)':              
 service_types = ['B Service', 'D Service', 'F Service', 'H Service', 'L Service', 'N Service', 'P Service', 'R Service', 'T Service']
 
 def get_services(df):
+    """Given either `master` as a dataframe, get the pivot table of services that client received during their stay.
+
+    :param df: `master`.
+    :type df: pandas.Dataframe.
+
+    """
+    # load services
     s = load_clean('services')
+    # merge services into `df`
     dfs = pd.merge(df, s, on='ClientID', how='right')
+    # only keep services that fall between the entry and exit dates
     dfs = dfs[(dfs['ProgramEntryDate'] <= dfs['ServiceStartDate']) & (dfs['ServiceStartDate'] < dfs['ProgramExitDate'])]
     dfs['value'] = True
+    # pivot out the services and return
     return pd.pivot_table(dfs, values='value', index=['EntryID'], columns='ServiceTypeL1')
 
 def print_usage():
@@ -778,6 +976,10 @@ def print_usage():
     print "Clean the given DFNAME into ./clean/"
 
 if __name__ == "__main__":
+    """Given the data frame name, load the raw data and cleaned dependencies, clean the raw data, and save it as a CSV
+    and a pickle.  This should be in the form `entry_details`, not `EntryDetails`.
+
+    """
     if len(sys.argv) != 2:
         print_usage()
     else:
