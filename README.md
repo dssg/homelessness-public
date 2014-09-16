@@ -12,6 +12,8 @@ Contributors
 Requirements
 ---
 
+HMIS data (for details on the data export, see data_dictionary.md)
+
 Python (we recommend installing anaconda as it will take care of all python dependencies):
 
 - pandas (0.14+)
