@@ -23,9 +23,11 @@ Python (we recommend installing anaconda as it will take care of all python depe
 - scipy
 - python multiprocessing
 
-    $ git clone git://github.com/dssg/caeh-public.git
-    $ cd caeh-public
+```
+    $ git clone git://github.com/dssg/homelessness-public.git
+    $ cd homelessness-public
     $ pip install -r requirements.txt
+```
 
 Non-Python:
 
